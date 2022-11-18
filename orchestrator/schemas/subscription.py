@@ -35,8 +35,10 @@ class PortMode(strEnum):
 
 class SubscriptionRelationSchema(OrchestratorBaseModel):
     domain_model_attr: Optional[str]
-    child_id: UUID
     parent_id: UUID
+    child_id: UUID
+    in_use_by_id: UUID
+    depends_on_id: UUID
     order_id: int
 
     class Config:
@@ -62,6 +64,8 @@ class SubscriptionInstanceBase(OrchestratorBaseModel):
     values: List[SubscriptionInstanceValueBaseSchema]
     parent_relations: List[SubscriptionRelationSchema]
     children_relations: List[SubscriptionRelationSchema]
+    in_use_by_block_relations: List[SubscriptionRelationSchema]
+    depends_on_block_relations: List[SubscriptionRelationSchema]
     product_block: ProductBlockSchema
 
     class Config:

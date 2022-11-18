@@ -12,9 +12,10 @@
 # limitations under the License.
 
 """Module that provides service functions on subscriptions."""
-
+import pickle  # noqa: S403
 from collections import defaultdict
 from datetime import datetime
+from hashlib import md5
 from typing import Any, Dict, List, Optional, Sequence, Tuple, TypeVar, Union, overload
 from uuid import UUID
 
@@ -25,6 +26,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Query, aliased, joinedload
 from sqlalchemy.sql.expression import or_
 
+from orchestrator.api.helpers import getattr_in, product_block_paths, update_in
 from orchestrator.db import (
     ProductTable,
     ResourceTypeTable,
@@ -33,9 +35,10 @@ from orchestrator.db import (
     SubscriptionTable,
     db,
 )
-from orchestrator.db.models import SubscriptionInstanceRelationTable
+from orchestrator.db.models import SubscriptionCustomerDescriptionTable, SubscriptionInstanceRelationTable
+from orchestrator.domain.base import SubscriptionModel
 from orchestrator.targets import Target
-from orchestrator.types import UUIDstr
+from orchestrator.types import SubscriptionLifecycle, UUIDstr
 from orchestrator.utils.datetime import nowtz
 
 logger = structlog.get_logger(__name__)
@@ -338,9 +341,9 @@ def find_values_for_resource_types(
     return rt2v
 
 
-def query_parent_subscriptions(subscription_id: UUID) -> Query:
+def query_in_use_by_subscriptions(subscription_id: UUID, filter_statuses: Optional[List[str]] = None) -> Query:
     """
-    Return a query with all subscriptions -parents- that use this subscription_id with resource_type.
+    Return a query with all subscriptions -in_use_by- that use this subscription with resource_type or direct relation.
 
     The query can be used to add extra filters when/where needed.
     """
@@ -356,14 +359,14 @@ def query_parent_subscriptions(subscription_id: UUID) -> Query:
     )
 
     # Find relations through instance hierarchy
-    parent_instances = aliased(SubscriptionInstanceTable)
-    child_instances = aliased(SubscriptionInstanceTable)
+    in_use_by_instances = aliased(SubscriptionInstanceTable)
+    depends_on_instances = aliased(SubscriptionInstanceTable)
     relation_relations = (
-        SubscriptionTable.query.join(parent_instances.subscription)
-        .join(parent_instances.children_relations)
-        .join(child_instances, SubscriptionInstanceRelationTable.child)
-        .filter(child_instances.subscription_id == subscription_id)
-        .filter(parent_instances.subscription_id != subscription_id)
+        SubscriptionTable.query.join(in_use_by_instances.subscription)
+        .join(in_use_by_instances.depends_on_block_relations)
+        .join(depends_on_instances, SubscriptionInstanceRelationTable.depends_on)
+        .filter(depends_on_instances.subscription_id == subscription_id)
+        .filter(in_use_by_instances.subscription_id != subscription_id)
         .with_entities(SubscriptionTable.subscription_id)
     )
 
@@ -371,13 +374,14 @@ def query_parent_subscriptions(subscription_id: UUID) -> Query:
         or_(
             SubscriptionTable.subscription_id.in_(resource_type_relations.scalar_subquery()),
             SubscriptionTable.subscription_id.in_(relation_relations.scalar_subquery()),
-        )
+        ),
+        SubscriptionTable.status.in_(filter_statuses if filter_statuses else SubscriptionLifecycle.values()),
     )
 
 
-def query_child_subscriptions(subscription_id: UUID) -> Query:
+def query_depends_on_subscriptions(subscription_id: UUID, filter_statuses: Optional[List[str]] = None) -> Query:
     """
-    Return a query with all subscriptions -children- that are used by this subscription in resource_type.
+    Return a query with all subscriptions -depends_on- that this subscription is dependent on with resource_type or direct relation.
 
     The query can be used to add extra filters when/where needed.
     """
@@ -392,14 +396,14 @@ def query_child_subscriptions(subscription_id: UUID) -> Query:
     )
 
     # Find relations through instance hierarchy
-    parent_instances = aliased(SubscriptionInstanceTable)
-    child_instances = aliased(SubscriptionInstanceTable)
+    in_use_by_instances = aliased(SubscriptionInstanceTable)
+    depends_on_instances = aliased(SubscriptionInstanceTable)
     relation_relations = (
-        SubscriptionTable.query.join(child_instances.subscription)
-        .join(child_instances.parent_relations)
-        .join(parent_instances, SubscriptionInstanceRelationTable.parent)
-        .filter(parent_instances.subscription_id == subscription_id)
-        .filter(child_instances.subscription_id != subscription_id)
+        SubscriptionTable.query.join(depends_on_instances.subscription)
+        .join(depends_on_instances.in_use_by_block_relations)
+        .join(in_use_by_instances, SubscriptionInstanceRelationTable.in_use_by)
+        .filter(in_use_by_instances.subscription_id == subscription_id)
+        .filter(depends_on_instances.subscription_id != subscription_id)
         .with_entities(SubscriptionTable.subscription_id)
     )
 
@@ -407,7 +411,8 @@ def query_child_subscriptions(subscription_id: UUID) -> Query:
         or_(
             SubscriptionTable.subscription_id.in_(resource_type_relations.scalar_subquery()),
             SubscriptionTable.subscription_id.in_(relation_relations.scalar_subquery()),
-        )
+        ),
+        SubscriptionTable.status.in_(filter_statuses if filter_statuses else SubscriptionLifecycle.values()),
     )
 
 
@@ -431,31 +436,32 @@ RELATION_RESOURCE_TYPES: List[str] = []
 
 
 def status_relations(subscription: SubscriptionTable) -> Dict[str, List[UUID]]:
-    """Return info about locked children or parents.
+    """Return info about locked subscription dependencies.
 
     This call will be used by the client to determine if it's safe to
     start a modify or terminate workflow. There are 4 cases:
 
-    1) The subscription is a IP, LightPath or ELAN: the child subscriptions are checked for not 'insync' instances.
-    2) The subscription is a ServicePort: parent subscription are checked for not 'insync' instances and for parent
+    1) The subscription is a IP, LightPath or ELAN: the depends_on subscriptions are checked for not 'insync' instances.
+    2) The subscription is a ServicePort: in_use_by subscriptions are checked for not 'insync' instances and for in_use_by
        services that are not terminated.
     3) The subscription is a Node: Related Core link subscriptions are checked that there are no active instances
        This is only used for the terminate workflow and ignored for modify
     4) IP_prefix cannot be terminated when in use
 
     """
-    parent_query = query_parent_subscriptions(subscription.subscription_id)
+    in_use_by_query = query_in_use_by_subscriptions(subscription.subscription_id)
 
-    unterminated_parents = _terminated_filter(parent_query)
-    locked_parent_relations = _in_sync_filter(parent_query)
+    unterminated_in_use_by_subscriptions = _terminated_filter(in_use_by_query)
+    locked_in_use_by_block_relations = _in_sync_filter(in_use_by_query)
 
-    query = query_child_subscriptions(subscription.subscription_id)
+    depends_on_query = query_depends_on_subscriptions(subscription.subscription_id)
 
-    locked_child_relations = _in_sync_filter(query)
+    locked_depends_on_block_relations = _in_sync_filter(depends_on_query)
 
     result = {
-        "locked_relations": locked_parent_relations + locked_child_relations,
-        "unterminated_parents": unterminated_parents,
+        "locked_relations": locked_in_use_by_block_relations + locked_depends_on_block_relations,
+        "unterminated_parents": unterminated_in_use_by_subscriptions,
+        "unterminated_in_use_by_subscriptions": unterminated_in_use_by_subscriptions,
     }
 
     logger.debug(
@@ -484,6 +490,9 @@ TARGET_DEFAULT_USABLE_MAP: Dict[Target, List[str]] = {
 WF_USABLE_MAP: Dict[str, List[str]] = {}
 
 WF_BLOCKED_BY_PARENTS: Dict[str, bool] = {}
+WF_BLOCKED_BY_IN_USE_BY_SUBSCRIPTIONS: Dict[str, bool] = {}
+
+WF_USABLE_WHILE_OUT_OF_SYNC: List[str] = ["modify_note"]
 
 
 def subscription_workflows(subscription: SubscriptionTable) -> Dict[str, Any]:
@@ -524,7 +533,7 @@ def subscription_workflows(subscription: SubscriptionTable) -> Dict[str, Any]:
     }
 
     for workflow in subscription.product.workflows:
-        if workflow.name in ["modify_note"] or workflow.target == Target.SYSTEM:
+        if workflow.name in WF_USABLE_WHILE_OUT_OF_SYNC or workflow.target == Target.SYSTEM:
             # validations and modify note are also possible with: not in sync or locked relations
             workflow_json = {"name": workflow.name, "description": workflow.description}
         else:
@@ -543,12 +552,45 @@ def subscription_workflows(subscription: SubscriptionTable) -> Dict[str, Any]:
                 workflow_json["action"] = "terminated" if workflow.target == Target.TERMINATE else "modified"
 
             # Check if this workflow is blocked because there are unterminated relations
-            blocked_by_parents = WF_BLOCKED_BY_PARENTS.get(workflow.name, workflow.target == Target.TERMINATE)
-            if blocked_by_parents and data["unterminated_parents"]:
-                workflow_json["reason"] = "subscription.no_modify_parent_subscription"
+            blocked_by_depends_on_subscriptions = WF_BLOCKED_BY_IN_USE_BY_SUBSCRIPTIONS.get(
+                workflow.name, workflow.target == Target.TERMINATE
+            )
+
+            if not blocked_by_depends_on_subscriptions:
+                blocked_by_depends_on_subscriptions = WF_BLOCKED_BY_PARENTS.get(
+                    workflow.name, workflow.target == Target.TERMINATE
+                )
+            if blocked_by_depends_on_subscriptions and data["unterminated_in_use_by_subscriptions"]:
+                workflow_json["reason"] = "subscription.no_modify_subscription_in_use_by_others"
                 workflow_json["unterminated_parents"] = data["unterminated_parents"]
+                workflow_json["unterminated_in_use_by_subscriptions"] = data["unterminated_in_use_by_subscriptions"]
                 workflow_json["action"] = "terminated" if workflow.target == Target.TERMINATE else "modified"
 
         workflows[workflow.target.lower()].append(workflow_json)
 
     return {**workflows, **default_json}
+
+
+def _generate_etag(model: dict) -> str:
+    encoded = pickle.dumps(model)
+    return md5(encoded).hexdigest()  # noqa: S303
+
+
+def build_extendend_domain_model(subscription_model: SubscriptionModel) -> dict:
+    customer_descriptions = SubscriptionCustomerDescriptionTable.query.filter(
+        SubscriptionCustomerDescriptionTable.subscription_id == subscription_model.subscription_id
+    ).all()
+
+    subscription = subscription_model.dict()
+    paths = product_block_paths(subscription_model)
+
+    # find all product blocks, check if they have in_use_by and inject the in_use_by_ids into the subscription dict.
+    for path in paths:
+        if in_use_by_subs := getattr_in(subscription_model, f"{path}.in_use_by"):
+            i_ids: List[Optional[UUID]] = []
+            i_ids.extend(in_use_by_subs.col[idx].in_use_by_id for idx, _ in enumerate(in_use_by_subs.col))
+            update_in(subscription, f"{path}.in_use_by_ids", i_ids)
+
+    subscription["customer_descriptions"] = customer_descriptions
+
+    return subscription

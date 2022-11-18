@@ -12,7 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, Dict, Optional, Type
+import sys
+from typing import Any, Callable, Dict, Optional, Type
 
 import sentry_sdk
 import structlog
@@ -20,6 +21,11 @@ import typer
 from fastapi.applications import FastAPI
 from fastapi_etag.dependency import add_exception_handler
 from nwastdlib.logging import initialise_logging
+
+# This is needed to avoid having a maintenance version of nwa-stdlib for py<3.10
+if sys.version_info >= (3, 10):
+    from nwastdlib.logging import ClearStructlogContextASGIMiddleware
+
 from opentelemetry import trace
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
@@ -27,13 +33,14 @@ from opentelemetry.instrumentation.psycopg2 import Psycopg2Instrumentor
 from opentelemetry.instrumentation.redis import RedisInstrumentor
 from opentelemetry.instrumentation.requests import RequestsInstrumentor
 from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
-from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
+from sentry_sdk.integrations.fastapi import FastApiIntegration
 from sentry_sdk.integrations.redis import RedisIntegration
 from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.responses import JSONResponse, Response
 
+from orchestrator import __version__
 from orchestrator.api.api_v1.api import api_router
 from orchestrator.api.error_handling import ProblemDetailException
 from orchestrator.cli.main import app as cli_app
@@ -43,6 +50,7 @@ from orchestrator.distlock import init_distlock_manager
 from orchestrator.domain import SUBSCRIPTION_MODEL_REGISTRY, SubscriptionModel
 from orchestrator.exception_handlers import form_error_handler, problem_detail_handler
 from orchestrator.forms import FormException
+from orchestrator.services.processes import ProcessDataBroadcastThread
 from orchestrator.settings import AppSettings, app_settings, tracer_provider
 from orchestrator.version import GIT_COMMIT_HASH
 from orchestrator.websocket import init_websocket_manager
@@ -58,13 +66,23 @@ class OrchestratorCore(FastAPI):
         openapi_url: str = "/api/openapi.json",
         docs_url: str = "/api/docs",
         redoc_url: str = "/api/redoc",
-        version: str = "1.0.0",
+        version: str = __version__,
         default_response_class: Type[Response] = JSONResponse,
         base_settings: AppSettings = app_settings,
         **kwargs: Any,
     ) -> None:
         websocket_manager = init_websocket_manager(base_settings)
         distlock_manager = init_distlock_manager(base_settings)
+        self.broadcast_thread = ProcessDataBroadcastThread(websocket_manager)
+
+        startup_functions: list[Callable] = [distlock_manager.connect_redis]
+        shutdown_functions: list[Callable] = [distlock_manager.disconnect_redis]
+        if websocket_manager.enabled:
+            startup_functions.extend([websocket_manager.connect_redis, self.broadcast_thread.start])
+            shutdown_functions.extend(
+                [websocket_manager.disconnect_all, self.broadcast_thread.stop, websocket_manager.disconnect_redis]
+            )
+
         super().__init__(
             title=title,
             description=description,
@@ -73,12 +91,8 @@ class OrchestratorCore(FastAPI):
             redoc_url=redoc_url,
             version=version,
             default_response_class=default_response_class,
-            on_startup=[websocket_manager.connect_redis, distlock_manager.connect_redis],
-            on_shutdown=[
-                websocket_manager.disconnect_redis,
-                websocket_manager.disconnect_all,
-                distlock_manager.disconnect_redis,
-            ],
+            on_startup=startup_functions,
+            on_shutdown=shutdown_functions,
             **kwargs,
         )
 
@@ -88,6 +102,9 @@ class OrchestratorCore(FastAPI):
 
         init_database(base_settings)
 
+        # This is needed to avoid having a maintenance version of nwa-stdlib for py<3.10
+        if sys.version_info >= (3, 10):
+            self.add_middleware(ClearStructlogContextASGIMiddleware)
         self.add_middleware(SessionMiddleware, secret_key=base_settings.SESSION_SECRET)
         self.add_middleware(DBSessionMiddleware, database=db)
         origins = base_settings.CORS_ORIGINS.split(",")
@@ -132,9 +149,8 @@ class OrchestratorCore(FastAPI):
             server_name=server_name,
             environment=environment,
             release=f"orchestrator@{release}",
-            integrations=[SqlalchemyIntegration(), RedisIntegration()],
+            integrations=[SqlalchemyIntegration(), RedisIntegration(), FastApiIntegration(transaction_style="url")],
         )
-        self.add_middleware(SentryAsgiMiddleware)
 
     @staticmethod
     def register_subscription_models(product_to_subscription_model_mapping: Dict[str, Type[SubscriptionModel]]) -> None:

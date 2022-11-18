@@ -22,11 +22,18 @@ from orchestrator.db import ProductTable, SubscriptionTable
 from orchestrator.forms import FormPage
 from orchestrator.forms.validators import ProductId
 from orchestrator.services import subscriptions
+from orchestrator.settings import app_settings
 from orchestrator.targets import Target
 from orchestrator.types import FormGenerator, InputForm, InputStepFunc, State, StateInputStepFunc
 from orchestrator.utils.state import form_inject_args
-from orchestrator.workflow import StepList, Workflow, done, init, make_workflow, step
-from orchestrator.workflows.steps import resync, store_process_subscription, unsync_unchecked
+from orchestrator.workflow import StepList, Workflow, conditional, done, init, make_workflow, step
+from orchestrator.workflows.steps import (
+    cache_domain_models,
+    remove_domain_model_from_cache,
+    resync,
+    store_process_subscription,
+    unsync_unchecked,
+)
 
 
 def _generate_new_subscription_form(workflow_target: str, workflow_name: str) -> InputForm:
@@ -34,7 +41,7 @@ def _generate_new_subscription_form(workflow_target: str, workflow_name: str) ->
         product: ProductId
 
         @validator("product", allow_reuse=True)
-        def product_validator(cls, v: UUID) -> UUID:
+        def product_validator(cls, v: UUID) -> UUID:  # type: ignore
             """Run validator for initial_input_forms to check if the product exists and that this workflow is valid to run for this product."""
             product = ProductTable.query.get(v)
             if product is None:
@@ -90,6 +97,7 @@ TRANSLATIONS = {
     "subscription.relations_not_in_sync": "This subscription can not be modified because some related subscriptions are not insync",
     "subscription.no_modify_invalid_status": "This subscription can not be modified because of the status it has",
     "subscription.no_modify_parent_subscription": "This subscription can not be modified as it is used in other subscriptions",
+    "subscription.no_modify_subscription_in_use_by_others": "This subscription can not be modified as it is used in other subscriptions",
     "subscription.no_modify_auto_negotiation": "This workflow is not valid for this subscription",
 }
 
@@ -101,7 +109,7 @@ def _generate_modify_form(workflow_target: str, workflow_name: str) -> InputForm
         subscription_id: UUID
 
         @validator("subscription_id", allow_reuse=True)
-        def subscription_validator(cls, v: UUID, values: Dict) -> UUID:
+        def subscription_validator(cls, v: UUID, values: Dict) -> UUID:  # type: ignore
             """Run validator for initial_input_forms to check if the subscription exists and that this workflow is valid to run for this subscription."""
             subscription = SubscriptionTable.query.get(v)
             if subscription is None:
@@ -182,7 +190,17 @@ def validate_workflow(description: str) -> Callable[[Callable[[], StepList]], Wo
     """
 
     def _validate_workflow(f: Callable[[], StepList]) -> Workflow:
-        steplist = init >> store_process_subscription(Target.SYSTEM) >> unsync_unchecked >> f() >> resync >> done
+        push_subscriptions = conditional(lambda _: app_settings.CACHE_DOMAIN_MODELS)
+        steplist = (
+            init
+            >> store_process_subscription(Target.SYSTEM)
+            >> push_subscriptions(remove_domain_model_from_cache)
+            >> unsync_unchecked
+            >> f()
+            >> resync
+            >> push_subscriptions(cache_domain_models)
+            >> done
+        )
 
         return make_workflow(f, description, validate_initial_input_form_generator, Target.SYSTEM, steplist)
 

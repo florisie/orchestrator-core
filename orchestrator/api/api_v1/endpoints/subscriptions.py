@@ -12,16 +12,19 @@
 # limitations under the License.
 
 """Module that implements subscription related API endpoints."""
-
 from http import HTTPStatus
 from typing import Any, Dict, List, Optional, Union
 from uuid import UUID
 
 import structlog
 from fastapi import Depends
+from fastapi.param_functions import Body
 from fastapi.routing import APIRouter
 from oauth2_lib.fastapi import OIDCUserModel
+from sqlalchemy import select
 from sqlalchemy.orm import contains_eager, defer, joinedload
+from starlette.exceptions import HTTPException
+from starlette.requests import Request
 from starlette.responses import Response
 
 from orchestrator.api.error_handling import raise_status
@@ -30,7 +33,6 @@ from orchestrator.db import (
     ProcessStepTable,
     ProcessSubscriptionTable,
     ProcessTable,
-    SubscriptionCustomerDescriptionTable,
     SubscriptionInstanceTable,
     SubscriptionTable,
     db,
@@ -39,12 +41,16 @@ from orchestrator.domain.base import SubscriptionModel
 from orchestrator.schemas import SubscriptionDomainModelSchema, SubscriptionSchema, SubscriptionWorkflowListsSchema
 from orchestrator.security import oidc_user
 from orchestrator.services.subscriptions import (
+    _generate_etag,
+    build_extendend_domain_model,
     get_subscription,
-    query_child_subscriptions,
-    query_parent_subscriptions,
+    query_depends_on_subscriptions,
+    query_in_use_by_subscriptions,
     subscription_workflows,
 )
 from orchestrator.settings import app_settings
+from orchestrator.types import SubscriptionLifecycle
+from orchestrator.utils.redis import from_redis
 
 router = APIRouter()
 
@@ -67,24 +73,61 @@ def _delete_process_subscriptions(process_subscriptions: List[ProcessSubscriptio
         _delete_subscription_tree(subscription)
 
 
+def _filter_statuses(filter_statuses: Optional[str] = None) -> List[str]:
+    """
+    Check valid filter statuses.
+
+    Args:
+        filter_statuses: the filters.
+
+    Returns:
+        list of filters
+
+    """
+    if not filter_statuses:
+        return []
+
+    logger.debug("Filters to query subscription on.", filter_statuses=filter_statuses)
+    statuses = filter_statuses.split(",")
+    for status in statuses:
+        if status not in SubscriptionLifecycle.values():
+            raise HTTPException(
+                status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
+                detail=f"Status {status}, is not a valid `SubscriptionLifecycle`",
+            )
+    return statuses
+
+
 @router.get("/all", response_model=List[SubscriptionSchema])
 def subscriptions_all() -> List[SubscriptionTable]:
     """Return subscriptions with only a join on products."""
     return SubscriptionTable.query.all()
 
 
-@router.get("/domain-model/{subscription_id}", response_model=SubscriptionDomainModelSchema)
-def subscription_details_by_id_with_domain_model(subscription_id: UUID) -> Dict[str, Any]:
-    customer_descriptions = SubscriptionCustomerDescriptionTable.query.filter(
-        SubscriptionCustomerDescriptionTable.subscription_id == subscription_id
-    ).all()
+@router.get("/domain-model/{subscription_id}", response_model=Optional[SubscriptionDomainModelSchema])
+def subscription_details_by_id_with_domain_model(
+    request: Request, subscription_id: UUID, response: Response
+) -> Optional[Dict[str, Any]]:
+    def _build_response(model: dict, etag: str) -> Optional[Dict[str, Any]]:
+        if etag == request.headers.get("If-None-Match"):
+            response.status_code = HTTPStatus.NOT_MODIFIED
+            return None
+        response.headers["ETag"] = etag
+        return model
 
-    subscription = SubscriptionModel.from_subscription(subscription_id).dict()
-    subscription["customer_descriptions"] = customer_descriptions
+    if cache_response := from_redis(subscription_id):
+        return _build_response(*cache_response)
 
-    if not subscription:
-        raise_status(HTTPStatus.NOT_FOUND)
-    return subscription
+    try:
+        subscription_model = SubscriptionModel.from_subscription(subscription_id)
+        extended_model = build_extendend_domain_model(subscription_model)
+        etag = _generate_etag(extended_model)
+        return _build_response(extended_model, etag)
+    except ValueError as e:
+        if str(e) == f"Subscription with id: {subscription_id}, does not exist":
+            raise_status(HTTPStatus.NOT_FOUND, f"Subscription with id: {subscription_id}, not found")
+        else:
+            raise_status(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
 
 
 @router.delete("/{subscription_id}", response_model=None)
@@ -102,14 +145,57 @@ def delete_subscription(subscription_id: UUID) -> None:
         return None
 
 
-@router.get("/parent_subscriptions/{subscription_id}", response_model=List[SubscriptionSchema])
-def parent_subscriptions(subscription_id: UUID) -> List[SubscriptionTable]:
-    return query_parent_subscriptions(subscription_id).all()
+@router.get("/in_use_by/{subscription_id}", response_model=List[SubscriptionSchema])
+def in_use_by_subscriptions(
+    subscription_id: UUID, filter_statuses: List[str] = Depends(_filter_statuses)
+) -> List[SubscriptionTable]:
+    """
+    Retrieve subscriptions that are in use by this subscription.
+
+    Args:
+        subscription_id: Subscription to query
+        filter_statuses: List of filters
+
+    Returns:
+        list of subscriptions
+
+    """
+    return query_in_use_by_subscriptions(subscription_id, filter_statuses).all()
 
 
-@router.get("/child_subscriptions/{subscription_id}", response_model=List[SubscriptionSchema])
-def child_subscriptions(subscription_id: UUID) -> List[SubscriptionTable]:
-    return query_child_subscriptions(subscription_id).all()
+@router.post("/subscriptions_for_in_used_by_ids", response_model=Dict[UUID, SubscriptionSchema])
+def subscriptions_by_in_used_by_ids(data: List[UUID] = Body(...)) -> Dict[UUID, SubscriptionSchema]:
+    rows = db.session.execute(
+        select(SubscriptionInstanceTable)
+        .join(SubscriptionTable)
+        .filter(SubscriptionInstanceTable.subscription_instance_id.in_(data))
+    ).all()
+    result = {row[0].subscription_instance_id: row[0].subscription for row in rows}
+    if len(rows) != len(data):
+        logger.warning(
+            "Not all subscription_instance_id's could be resolved.",
+            unresolved_ids=list(set(data) - set(result.keys())),
+        )
+    return result
+
+
+@router.get("/depends_on/{subscription_id}", response_model=List[SubscriptionSchema])
+def depends_on_subscriptions(
+    subscription_id: UUID,
+    filter_statuses: List[str] = Depends(_filter_statuses),
+) -> List[SubscriptionTable]:
+    """
+    Retrieve dependant subscriptions.
+
+    Args:
+        subscription_id: The subscription id
+        filter_statuses: the status of dependant subscriptions
+
+    Returns:
+        List of dependant subscriptions.
+
+    """
+    return query_depends_on_subscriptions(subscription_id, filter_statuses).all()
 
 
 @router.get("/", response_model=List[SubscriptionSchema])
@@ -154,16 +240,22 @@ def subscription_workflows_by_id(subscription_id: UUID) -> Dict[str, List[Dict[s
 
 
 @router.get("/instance/other_subscriptions/{subscription_instance_id}", response_model=List[UUID])
-def subscription_instance_parents(subscription_instance_id: UUID) -> List[UUID]:
-    subscription_instance = SubscriptionInstanceTable.query.get(subscription_instance_id)
+def subscription_instance_in_use_by(
+    subscription_instance_id: UUID, filter_statuses: List[str] = Depends(_filter_statuses)
+) -> List[UUID]:
+    subscription_instance: SubscriptionInstanceTable = SubscriptionInstanceTable.query.get(subscription_instance_id)
 
     if not subscription_instance:
         raise_status(HTTPStatus.NOT_FOUND)
 
+    in_use_by_instances = subscription_instance.in_use_by
+    if filter_statuses:
+        in_use_by_instances = [sub for sub in in_use_by_instances if sub.subscription.status in filter_statuses]
+
     return list(
         filter(
             lambda sub_id: sub_id != subscription_instance.subscription_id,
-            {parent.subscription_id for parent in subscription_instance.parents},
+            {sub.subscription_id for sub in in_use_by_instances},
         )
     )
 
@@ -189,9 +281,9 @@ def subscription_set_in_sync(subscription_id: UUID, current_user: Optional[OIDCU
             logger.info(
                 "Subscription not in sync, trying to change..", subscription_id=subscription_id, user=current_user
             )
-            failed_processes = failed_processes()  # type: ignore
-            if not failed_processes:
-                subscription.insync = True  # type: ignore
+            failed_processes_list = failed_processes()
+            if not failed_processes_list:
+                subscription.insync = True
                 db.session.commit()
                 logger.info("Subscription set in sync", user=current_user)
             else:

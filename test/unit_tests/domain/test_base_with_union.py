@@ -1,6 +1,7 @@
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 
 from orchestrator.db import db
 from orchestrator.types import SubscriptionLifecycle
@@ -34,8 +35,9 @@ def test_product_model_with_union_type_directly_below(
         ),
     )
 
-    with pytest.raises(AttributeError):
+    with pytest.raises(ValidationError) as error:
         UnionProduct.from_other_lifecycle(union_subscription_inactive, SubscriptionLifecycle.ACTIVE)
+    assert error.value.errors()[0]["msg"] == "none is not an allowed value"
 
     new_sub_block = SubBlockOneForTest.new(
         subscription_id=union_subscription_inactive.subscription_id, int_field=1, str_field="2"
@@ -99,12 +101,6 @@ def test_union_product_block_as_sub(
         union_subscription_from_database.test_block.union_block.subscription_instance_id
         == sub_one_subscription_1.test_block.subscription_instance_id
     )
-
-    # TODO #1321: uncomment test code below after SAFE_PARENT_TRANSITIONS_FOR_STATUS check has been re-done
-    # sub_subscription_terminated = ProductSubOne.from_other_lifecycle(
-    #     sub_one_subscription_1, SubscriptionLifecycle.TERMINATED
-    # )
-
-    # # Do not allow subscriptions that have a parent make an unsafe transition.
-    # with pytest.raises(ValueError):
-    #     sub_subscription_terminated.save()
+    # Do not allow subscriptions that are in use by other subscriptions make an unsafe transition.
+    with pytest.raises(ValueError):
+        ProductSubOne.from_other_lifecycle(sub_one_subscription_1, SubscriptionLifecycle.TERMINATED)

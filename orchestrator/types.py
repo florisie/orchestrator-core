@@ -14,6 +14,15 @@
 from enum import Enum
 from http import HTTPStatus
 from typing import Any, Callable, Dict, Generator, List, Literal, Optional, Tuple, Type, TypedDict, TypeVar, Union
+from uuid import UUID
+
+try:
+    # python3.10 introduces types.UnionType for the new union and optional type defs.
+    from types import UnionType
+
+    union_types = [Union, UnionType]
+except ImportError:
+    union_types = [Union]
 
 from pydantic import BaseModel
 from pydantic.typing import get_args, get_origin
@@ -32,6 +41,7 @@ ErrorState = Union[str, Exception, Tuple[str, Union[int, HTTPStatus]]]
 ErrorDict = Dict[str, Union[str, int, List[Dict[str, Any]], "InputForm", None]]
 StateStepFunc = Callable[[State], State]
 StepFunc = Callable[..., Optional[State]]
+BroadcastFunc = Callable[[UUID, Dict], None]
 
 
 class strEnum(str, Enum):
@@ -64,6 +74,40 @@ class AcceptItemType(strEnum):
     SKIP = "skip"
     VALUE = "value"
     MARGIN = "margin"
+
+
+# TODO #1321: old code that protected against unsafe changes in subs
+# The key is the Parent subscription life cycle status. The keys are lists of safe transitions for child subscriptions.
+SAFE_USED_BY_TRANSITIONS_FOR_STATUS = {
+    SubscriptionLifecycle.INITIAL: [
+        SubscriptionLifecycle.INITIAL,
+    ],
+    SubscriptionLifecycle.ACTIVE: [
+        SubscriptionLifecycle.INITIAL,
+        SubscriptionLifecycle.PROVISIONING,
+        SubscriptionLifecycle.MIGRATING,
+        SubscriptionLifecycle.ACTIVE,
+        SubscriptionLifecycle.TERMINATED,
+        SubscriptionLifecycle.DISABLED,
+    ],
+    SubscriptionLifecycle.MIGRATING: [
+        SubscriptionLifecycle.INITIAL,
+        SubscriptionLifecycle.MIGRATING,
+        SubscriptionLifecycle.TERMINATED,
+    ],
+    SubscriptionLifecycle.PROVISIONING: [
+        SubscriptionLifecycle.INITIAL,
+        SubscriptionLifecycle.PROVISIONING,
+        SubscriptionLifecycle.ACTIVE,
+        SubscriptionLifecycle.TERMINATED,
+    ],
+    SubscriptionLifecycle.TERMINATED: [SubscriptionLifecycle.INITIAL, SubscriptionLifecycle.TERMINATED],
+    SubscriptionLifecycle.DISABLED: [
+        SubscriptionLifecycle.INITIAL,
+        SubscriptionLifecycle.DISABLED,
+        SubscriptionLifecycle.TERMINATED,
+    ],
+}
 
 
 AcceptData = List[Union[Tuple[str, AcceptItemType], Tuple[str, AcceptItemType, Dict]]]
@@ -101,6 +145,9 @@ def is_of_type(t: Any, test_type: Any) -> bool:
     >>> is_of_type(int, str)
     False
     """
+
+    if is_union_type(test_type):
+        return any(get_origin(t) is get_origin(arg) for arg in get_args(test_type))
 
     if (
         get_origin(t)
@@ -152,7 +199,7 @@ def is_list_type(t: Any, test_type: Optional[type] = None) -> bool:
     >>> is_list_type(List[Union[str, int]])
     True
     >>> is_list_type(List[Union[str, int]], Union[str, int])
-    True
+    False
     >>> is_list_type(List[Union[str, int]], str)
     True
     >>> is_list_type(List[Union[str, int]], int)
@@ -199,19 +246,13 @@ def is_optional_type(t: Any, test_type: Optional[type] = None) -> bool:
     False
     >>> is_optional_type(Optional[State], State)
     True
-    >>> is_optional_type(int)
-    False
     """
-    if get_origin(t):
-        if get_origin(t) == Union and None.__class__ in get_args(t):  # type:ignore
-            for arg in get_args(t):
-                if arg is None.__class__:
-                    continue
+    if get_origin(t) in union_types and None.__class__ in get_args(t):
+        for arg in get_args(t):
+            if arg is None.__class__:
+                continue
 
-                if test_type:
-                    return is_of_type(arg, test_type)
-                else:
-                    return True
+            return not test_type or is_of_type(arg, test_type)
     return False
 
 
@@ -226,23 +267,22 @@ def is_union_type(t: Any, test_type: Optional[type] = None) -> bool:
     True
     >>> is_union_type(Union[int, str], Union[int, str])
     True
+    >>> is_union_type(Union[int, None])
+    True
     >>> is_union_type(int)
     False
-
     """
-    if get_origin(t):
-        if get_origin(t) == Union:  # type: ignore
-            if test_type:
-                if is_of_type(t, test_type):
-                    return True
-                for arg in get_args(t):
-                    result = is_of_type(arg, test_type)
-                    if result:
-                        return result
-                return False
-            else:
-                return True
+    if get_origin(t) not in union_types:
+        return False
+    if not test_type:
+        return True
 
+    if is_of_type(t, test_type):
+        return True
+    for arg in get_args(t):
+        result = is_of_type(arg, test_type)
+        if result:
+            return result
     return False
 
 
@@ -250,7 +290,10 @@ def get_possible_product_block_types(list_field_type: Any) -> dict:
     possible_product_block_types = {}
     if is_union_type(list_field_type):
         for list_item_field_type in get_args(list_field_type):
-            if list_item_field_type.name not in possible_product_block_types:
+            if (
+                not isinstance(None, list_item_field_type)
+                and list_item_field_type.name not in possible_product_block_types
+            ):
                 possible_product_block_types[list_item_field_type.name] = list_item_field_type
     else:
         possible_product_block_types = {list_field_type.name: list_field_type}

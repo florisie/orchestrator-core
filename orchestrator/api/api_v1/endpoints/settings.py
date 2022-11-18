@@ -14,11 +14,11 @@
 from http import HTTPStatus
 from typing import Optional
 
-from aiocache import Cache
 from fastapi import Query, WebSocket
 from fastapi.param_functions import Depends
 from fastapi.routing import APIRouter
 from oauth2_lib.fastapi import OIDCUserModel
+from redis.asyncio import Redis as AIORedis
 from starlette.background import BackgroundTasks
 
 from orchestrator.api.error_handling import raise_status
@@ -29,18 +29,21 @@ from orchestrator.services import settings
 from orchestrator.services.processes import SYSTEM_USER
 from orchestrator.settings import app_settings
 from orchestrator.utils.json import json_dumps
-from orchestrator.websocket import WS_CHANNELS, websocket_enabled, websocket_manager
+from orchestrator.websocket import WS_CHANNELS, websocket_manager
 
 router = APIRouter()
 
 
-@router.delete("/cache/{name}", status_code=HTTPStatus.NO_CONTENT)
+@router.delete("/cache/{name}")
 async def clear_cache(name: str, background_tasks: BackgroundTasks) -> None:
-    cache = Cache(Cache.REDIS, endpoint=app_settings.CACHE_HOST, port=app_settings.CACHE_PORT)
+    cache: AIORedis = AIORedis(host=app_settings.CACHE_HOST, port=app_settings.CACHE_PORT)
     if name == "all":
-        await cache.clear(namespace="orchestrator")
+        key_name = "orchestrator:*"
     else:
-        await cache.clear(namespace=f"orchestrator:{name}")
+        key_name = f"orchestrator:{name}:*"
+    keys = await cache.keys(key_name)
+    if keys:
+        await cache.delete(*keys)
 
 
 @router.put("/status", response_model=EngineSettingsSchema)
@@ -93,22 +96,23 @@ def get_global_status() -> EngineSettingsSchema:
     return generate_engine_status_response(engine_settings)
 
 
-@router.websocket("/ws-status/")
-@websocket_enabled
-async def websocket_get_global_status(websocket: WebSocket, token: str = Query(...)) -> None:
-    error = await websocket_manager.authorize(websocket, token)
+if app_settings.ENABLE_WEBSOCKETS:
 
-    await websocket.accept()
-    if error:
-        await websocket_manager.disconnect(websocket, reason=error)
-        return
+    @router.websocket("/ws-status/")
+    async def websocket_get_global_status(websocket: WebSocket, token: str = Query(...)) -> None:
+        error = await websocket_manager.authorize(websocket, token)
 
-    engine_settings = EngineSettingsTable.query.one()
+        await websocket.accept()
+        if error:
+            await websocket_manager.disconnect(websocket, reason=error)
+            return
 
-    await websocket.send_text(json_dumps({"engine-status": generate_engine_status_response(engine_settings)}))
+        engine_settings = EngineSettingsTable.query.one()
 
-    channel = WS_CHANNELS.ENGINE_SETTINGS
-    await websocket_manager.connect(websocket, channel)
+        await websocket.send_text(json_dumps({"engine-status": generate_engine_status_response(engine_settings)}))
+
+        channel = WS_CHANNELS.ENGINE_SETTINGS
+        await websocket_manager.connect(websocket, channel)
 
 
 def generate_engine_status_response(engine_settings: EngineSettingsTable) -> EngineSettingsSchema:

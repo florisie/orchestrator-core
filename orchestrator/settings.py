@@ -49,6 +49,7 @@ class AppSettings(BaseSettings):
     MAIL_STARTTLS: bool = False
     CACHE_HOST: str = "127.0.0.1"
     CACHE_PORT: int = 6379
+    CACHE_DOMAIN_MODELS: bool = False
     ENABLE_DISTLOCK_MANAGER: bool = True
     DISTLOCK_BACKEND: str = "memory"
     CC_NOC: int = 0
@@ -62,6 +63,8 @@ class AppSettings(BaseSettings):
     WEBSOCKET_BROADCASTER_URL: str = "memory://"
     ENABLE_WEBSOCKETS: bool = True
     DISABLE_INSYNC_CHECK: bool = False
+    DEFAULT_PRODUCT_WORKFLOWS: List[str] = ["modify_note"]
+    SKIP_MODEL_FOR_MIGRATION_DB_DIFF: List[str] = []
 
 
 class Oauth2Settings(BaseSettings):

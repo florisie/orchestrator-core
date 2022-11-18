@@ -1,5 +1,5 @@
 # What is a workflow and how does it work?
-The workflow engine is the core of the software it has been created to execute a number of functions.
+The workflow engine is the core of the software, it has been created to execute a number of functions.
 
 - Safely and reliable manipulate customer `Subscriptions` from one state to the next and maintain auditability.
 - Create an API through which programatically `Subscriptions` can be manipulated.
@@ -125,10 +125,14 @@ These workflows have more in common with each other than not, it's mostly a matt
 
 ### Execution parameters
 
-By default, the associated workflow can only be run on a subscription with a lifecycle state set to `ACTIVE`. This behavior can be changed in the following data structure in the `workflows/__init__.py` file:
+There are a few parameters to finetune workflow execution constraints. The recommended place to alter them is from the workflows module, i.e. in `workflows/__init__.py`. Refer to the examples below.
+
+1. `WF_USABLE_MAP`: configure subscription lifecycles on which a workflow is usable
+
+By default, the associated workflow can only be run on a subscription with a lifecycle state set to `ACTIVE`. This behavior can be changed in the `WF_USABLE_MAP` data structure:
 
 ```python
-from orchestrator.services.subscriptions import WF_BLOCKED_BY_PARENTS
+from orchestrator.services.subscriptions import WF_USABLE_MAP
 
 WF_USABLE_MAP.update(
     {
@@ -139,7 +143,43 @@ WF_USABLE_MAP.update(
 )
 ```
 
-Now validate and provision can be run on subscriptions in either active or provisioning states and modify can *only* be run on one in the provisioning state. The exception is terminate, those can be run on any state unless constrained here.
+Now validate and provision can be run on subscriptions in either `ACTIVE` or `PROVISIONING` states and modify can *only* be run on subscriptions in the `PROVISIONING` state. The exception is terminate, those workflows can be run on subscriptions in any state unless constrained here.
+
+2. `WF_BLOCKED_BY_IN_USE_BY_SUBSCRIPTIONS`: block modify workflows on subscriptions with unterminated `in_use_by` subscriptions
+
+By default, only terminate workflows are prohibited from running on subscriptions with unterminated `in_use_by` subscriptions. This behavior can be changed in the `WF_BLOCKED_BY_IN_USE_BY_SUBSCRIPTIONS` data structure:
+
+```python
+from orchestrator.services.subscriptions import WF_BLOCKED_BY_IN_USE_BY_SUBSCRIPTIONS
+
+WF_BLOCKED_BY_IN_USE_BY_SUBSCRIPTIONS.update(
+    {
+        "modify_node_enrollment": True
+    }
+)
+```
+
+With this configuration, both terminate and modify will not run on subscriptions with unterminated `in_use_by` subscriptions.
+
+3. `WF_USABLE_WHILE_OUT_OF_SYNC`: allow specific workflows on out of sync subscriptions
+
+By default, only system workflows (tasks) are allowed to run on subscriptions that are not in sync. This behavior can be changed with the `WF_USABLE_WHILE_OUT_OF_SYNC` data structure:
+
+```python
+from orchestrator.services.subscriptions import WF_USABLE_WHILE_OUT_OF_SYNC
+
+WF_USABLE_WHILE_OUT_OF_SYNC.extend(
+    [
+        "modify_description"
+    ]
+)
+```
+
+Now this particular modify workflow can be run on subscriptions that are not in sync.
+
+!!! danger
+    It is potentially dangerous to run workflows on subscriptions that are not in sync. Only use this for small and
+    specific usecases, such as editing a description that is only used within orchestrator.
 
 #### Initial state
 
@@ -239,3 +279,11 @@ def load_subscription_info(state: State) -> FormGenerator:
     node = get_detailed_node(subscription["ne"]["esdb_node_id"])
     return {"subscription": subscription, "node_name": node.get("name")}
 ```
+
+## Default Workflows
+
+A Default Workflows mechanism is provided to provide a way for a given workflow to be automatically attached to all Products. To ensure this, modify the `DEFAULT_PRODUCT_WORKFLOWS` environment variable, and be sure to use `helpers.create()` in your migration. 
+
+Alternatively, be sure to execute `ensure_default_workflows()` within the migration if using `helpers.create()` is not desirable.
+
+By default, `DEFAULT_PRODUCT_WORKFLOWS` is set to `['modify_note']`.
