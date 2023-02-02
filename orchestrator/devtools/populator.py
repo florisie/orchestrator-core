@@ -263,11 +263,14 @@ class Populator:
                 value = ""
 
             if value is None:
-                log.error("Unable to resolve input field", input_field=input_field)
-                raise Exception(f"Unable to resolve input field: {field_name}")
+                if value not in self.fields_to_skip_when_empty:
+                    log.error("Unable to resolve input field", input_field=input_field)
+                    raise Exception(f"Unable to resolve input field: {field_name}")
 
             log.debug("Resolved input_field.", value=value)
-            data[field_name] = value
+
+            if value not in self.fields_to_skip_when_empty:
+                data[field_name] = value
         return data
 
     def _start_workflow(self, workflow_name: str, **kwargs: Any) -> UUIDstr:
